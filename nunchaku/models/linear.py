@@ -4,10 +4,255 @@ Quantized linear layers for Nunchaku.
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from ..ops.gemm import svdq_gemm_w4a4_cuda
 from ..ops.gemv import awq_gemv_w4a16_cuda
 from ..ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda
+from ..lora.flux.nunchaku_converter import unpack_lowrank_weight
+
+class SVDQW4A8Linear(nn.Module):
+    """
+    fake quantization for experimentation. 
+    this linear class will get swapped in after weights are loaded in
+    NunchakuFluxTransformer2DModelV2
+    """
+    def __init__(
+        self,
+        qweight: torch.Tensor,
+        wscales: torch.Tensor,
+        smooth_factor: torch.Tensor,
+        proj_down: torch.Tensor,
+        proj_up: torch.Tensor,
+        bias: torch.Tensor | None,
+        group_size: int,
+        in_features: int,
+        out_features: int,
+        act_unsigned: bool,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.act_unsigned = act_unsigned
+        self.register_buffer("smooth_factor", smooth_factor)
+        self.register_buffer("proj_down", unpack_lowrank_weight(proj_down, down=True).T)
+        self.register_buffer("proj_up", unpack_lowrank_weight(proj_up, down=False))
+        self.register_buffer("bias", bias)
+        self.register_buffer("w_bf16", self._dequantize_weights(qweight, wscales))
+      
+    def _dequantize_weights(self, qweight, wscales):
+        #constants for bits=4, warp_n=128 in NunchakuWeightPacker.pack_weight from packer.py
+        #we have to reverse the packer basically, thats what the views and permutes and
+        #shifts do
+        mem_n = 128
+        mem_k = 64 
+        num_n_packs = 8
+        n_pack_size = 2
+        num_n_lanes = 8
+        reg_n = 1
+        num_k_packs = 1
+        k_pack_size = 2
+        num_k_lanes = 4
+        reg_k = 8
+        n_tiles, k_tiles = self.out_features // mem_n, self.in_features // mem_k
+        
+        w32 = qweight.contiguous().view(self.out_features, -1).view(dtype=torch.int32)
+        shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=qweight.device)
+        nibbles = (w32.unsqueeze(-1) >> shifts) & 0xF
+        
+        nibbles = nibbles.reshape(
+            n_tiles, 
+            k_tiles, 
+            num_k_packs, 
+            num_n_packs, 
+            num_n_lanes,
+            num_k_lanes, 
+            n_pack_size, 
+            k_pack_size, 
+            reg_n, 
+            reg_k,
+        )
+        
+        nibbles = nibbles.permute(0, 3, 6, 4, 8, 1, 2, 7, 5, 9).contiguous()
+        nibbles = nibbles.view(self.out_features, -1)
+        nibbles = torch.where(nibbles >= 8, nibbles - 16, nibbles)
+        nibbles = nibbles.to(torch.bfloat16)
+        
+        num_groups = self.in_features // self.group_size
+        
+        #using the warp_n=128 values for the constants below from pack_scale in packer.py
+        warp_s = 128
+        num_s_packs = 1
+        num_s_lanes = 32
+        s_pack_size = 4
+        scale = wscales.reshape(
+            self.out_features // warp_s, -1, num_s_packs, num_s_lanes // 4, 4, s_pack_size // 2, 2
+        )
+        scale = scale.permute(0, 2, 3, 5, 4, 6, 1).contiguous()
+        scale = scale.view(self.out_features, num_groups)
+
+        w_bf16 = nibbles.reshape(self.out_features, num_groups, self.group_size) * scale.unsqueeze(-1)
+        return w_bf16.reshape(self.out_features, self.in_features)
+    
+    def forward(self, x):
+        in_shape = x.shape
+        lora = x @ self.proj_down @ self.proj_up.T
+
+        x = x / self.smooth_factor
+
+        x = x.reshape(-1, self.in_features)
+        amax = x.abs().amax()
+        scale = 1.0 if amax == 0 else amax / 127
+        x = torch.round(x / scale).clamp(-128, 127) * scale
+
+        out = lora + (x @ self.w_bf16.T).view(*in_shape[:-1], self.out_features)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+        return out
+
+    @classmethod
+    def from_svdq_linear(cls, layer: "SVDQW4A4Linear", device="cpu"):
+        return cls(
+            qweight=layer.qweight.data.to(device),
+            wscales=layer.wscales.data.to(device),
+            smooth_factor=layer.smooth_factor.data.to(device),
+            proj_down=layer.proj_down.data.to(device),
+            proj_up=layer.proj_up.data.to(device),
+            bias=layer.bias.data.to(device) if layer.bias is not None else None,
+            group_size=layer.group_size,
+            in_features=layer.in_features,
+            out_features=layer.out_features,
+            act_unsigned=layer.act_unsigned,
+        )
+
+
+def _unpack_rotemb(packed):
+    """Inverse of pack_rotemb from nunchaku.models.embeddings.
+
+    packed: [B, M, D] (MMA-packed rotary embeddings)
+    returns: [B, M, D//2, 1, 2] where [..., 0]=sin, [..., 1]=cos
+    """
+    B, M, D = packed.shape
+    x = packed.view(B, M // 16, D // 8, 8, 4, 2, 2)
+    x = x.permute(0, 1, 2, 5, 3, 4, 6)
+    x = x.reshape(B, M // 16, D // 8, 16, 8)
+    x = x.permute(0, 1, 3, 2, 4)
+    x = x.reshape(B, M, D // 2, 1, 2)
+    return x
+
+
+def _apply_rotary(x, rotemb):
+    """Apply rotary embedding from nunchaku raw format.
+
+    x: [B, S, heads, head_dim]
+    rotemb: [B_emb, S_emb, head_dim//2, 1, 2]  (sin=0, cos=1)
+    """
+    S = x.shape[1]
+    cos = rotemb[0, :S, :, 0, 1]  # [S, head_dim//2]
+    sin = rotemb[0, :S, :, 0, 0]  # [S, head_dim//2]
+
+    x_r, x_i = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D/2]
+    cos = cos[None, :, None, :]  # [1, S, 1, D/2]
+    sin = sin[None, :, None, :]
+    out_r = x_r.float() * cos - x_i.float() * sin
+    out_i = x_r.float() * sin + x_i.float() * cos
+    return torch.stack([out_r, out_i], dim=-1).flatten(-2).to(x.dtype)
+
+
+class FakeQuantFluxAttnProcessor:
+    """Pure-PyTorch attention processor for SVDQW4A8Linear layers.
+
+    Replaces NunchakuFluxFA2Processor when fused CUDA kernels cannot be used.
+    """
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, image_rotary_emb=None, **kwargs):
+        B, S, C = hidden_states.shape
+
+        # Fused QKV via forward() (works with SVDQW4A8Linear)
+        qkv = attn.to_qkv(hidden_states)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, S, attn.heads, attn.head_dim)
+        k = k.view(B, S, attn.heads, attn.head_dim)
+        v = v.view(B, S, attn.heads, attn.head_dim)
+        q = attn.norm_q(q)
+        k = attn.norm_k(k)
+
+        # Rotary embeddings for image tokens
+        if isinstance(image_rotary_emb, tuple):
+            rotemb_img = _unpack_rotemb(image_rotary_emb[0])
+        elif image_rotary_emb is not None:
+            rotemb_img = _unpack_rotemb(image_rotary_emb)
+        else:
+            rotemb_img = None
+
+        if rotemb_img is not None:
+            q = _apply_rotary(q, rotemb_img)
+            k = _apply_rotary(k, rotemb_img)
+
+        if attn.added_kv_proj_dim is not None and encoder_hidden_states is not None:
+            S_ctx = encoder_hidden_states.shape[1]
+            qkv_ctx = attn.add_qkv_proj(encoder_hidden_states)
+            q_c, k_c, v_c = qkv_ctx.chunk(3, dim=-1)
+            q_c = q_c.view(B, S_ctx, attn.heads, attn.head_dim)
+            k_c = k_c.view(B, S_ctx, attn.heads, attn.head_dim)
+            v_c = v_c.view(B, S_ctx, attn.heads, attn.head_dim)
+            q_c = attn.norm_added_q(q_c)
+            k_c = attn.norm_added_k(k_c)
+
+            rotemb_txt = _unpack_rotemb(image_rotary_emb[1])
+            q_c = _apply_rotary(q_c, rotemb_txt)
+            k_c = _apply_rotary(k_c, rotemb_txt)
+
+            q = torch.cat([q_c, q], dim=1)
+            k = torch.cat([k_c, k], dim=1)
+            v = torch.cat([v_c, v], dim=1)
+
+        # SDPA
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(B, -1, C)
+        out = out.to(q.dtype)
+
+        if encoder_hidden_states is not None:
+            S_ctx = encoder_hidden_states.shape[1]
+            enc_out, img_out = out[:, :S_ctx], out[:, S_ctx:]
+            img_out = attn.to_out[0](img_out)
+            img_out = attn.to_out[1](img_out)
+            enc_out = attn.to_add_out(enc_out)
+            return img_out, enc_out
+        else:
+            return attn.to_out(out)
+
+
+def replace_with_fake_quant(model: nn.Module) -> nn.Module:
+    """Replace SVDQW4A4Linear layers with fake-quantized W4A8 and patch fused ops.
+
+    Call after from_pretrained so weights are already loaded. Builds replacement
+    layers on CPU. Caller should handle device placement (e.g.
+    pipeline.enable_sequential_cpu_offload()).
+    """
+    from .transformers.transformer_flux_v2 import NunchakuFluxAttention
+
+    for name, child in list(model.named_modules()):
+        if isinstance(child, SVDQW4A4Linear):
+            *path, attr = name.split(".")
+            parent = model
+            for p in path:
+                parent = getattr(parent, p)
+            setattr(parent, attr, SVDQW4A8Linear.from_svdq_linear(child, device="cpu"))
+
+    # Swap attention processors to pure-PyTorch version
+    for module in model.modules():
+        if isinstance(module, NunchakuFluxAttention):
+            module.processor = FakeQuantFluxAttnProcessor()
+
+    return model
 
 
 class SVDQW4A4Linear(nn.Module):

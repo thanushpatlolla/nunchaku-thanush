@@ -317,7 +317,7 @@ class NunchakuFluxSingleTransformerBlock(FluxSingleTransformerBlock):
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
 
         # Feedforward
-        if isinstance(self.act_mlp, GELU):
+        if isinstance(self.act_mlp, GELU) and isinstance(self.mlp_fc1, SVDQW4A4Linear):
             # Use fused GELU MLP for efficiency.
             mlp_hidden_states = fused_gelu_mlp(norm_hidden_states, self.mlp_fc1, self.mlp_fc2)
         else:

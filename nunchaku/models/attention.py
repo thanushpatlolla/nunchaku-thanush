@@ -114,7 +114,7 @@ class NunchakuFeedForward(FeedForward):
         torch.Tensor, shape (B, D)
             Output tensor after feed-forward transformation.
         """
-        if isinstance(self.net[0], GELU):
+        if isinstance(self.net[0], GELU) and isinstance(self.net[0].proj, SVDQW4A4Linear):
             return fused_gelu_mlp(hidden_states, self.net[0].proj, self.net[2])
         else:
             # Fallback to original implementation
