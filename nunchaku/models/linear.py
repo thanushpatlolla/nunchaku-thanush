@@ -93,6 +93,7 @@ class SVDQW4A8Linear(nn.Module):
         scale = scale.view(self.out_features, num_groups)
 
         w_bf16 = nibbles.reshape(self.out_features, num_groups, self.group_size) * scale.unsqueeze(-1)
+        
         return w_bf16.reshape(self.out_features, self.in_features)
     
     def forward(self, x):
@@ -100,8 +101,8 @@ class SVDQW4A8Linear(nn.Module):
         lora = x @ self.proj_down @ self.proj_up.T
 
         x = x / self.smooth_factor
-
         x = x.reshape(-1, self.in_features)
+
         amax = x.abs().amax()
         scale = 1.0 if amax == 0 else amax / 127
         x = torch.round(x / scale).clamp(-128, 127) * scale
@@ -114,14 +115,14 @@ class SVDQW4A8Linear(nn.Module):
         return out
 
     @classmethod
-    def from_svdq_linear(cls, layer: "SVDQW4A4Linear", device="cpu"):
+    def from_svdq_linear(cls, layer: "SVDQW4A4Linear"):
         return cls(
-            qweight=layer.qweight.data.to(device),
-            wscales=layer.wscales.data.to(device),
-            smooth_factor=layer.smooth_factor.data.to(device),
-            proj_down=layer.proj_down.data.to(device),
-            proj_up=layer.proj_up.data.to(device),
-            bias=layer.bias.data.to(device) if layer.bias is not None else None,
+            qweight=layer.qweight.data,
+            wscales=layer.wscales.data,
+            smooth_factor=layer.smooth_factor.data,
+            proj_down=layer.proj_down.data,
+            proj_up=layer.proj_up.data,
+            bias=layer.bias.data if layer.bias is not None else None,
             group_size=layer.group_size,
             in_features=layer.in_features,
             out_features=layer.out_features,
@@ -163,7 +164,7 @@ def _apply_rotary(x, rotemb):
 
 
 class FakeQuantFluxAttnProcessor:
-    """Pure-PyTorch attention processor for SVDQW4A8Linear layers.
+    """PyTorch attention processor for SVDQW4A8Linear layers.
 
     Replaces NunchakuFluxFA2Processor when fused CUDA kernels cannot be used.
     """
@@ -234,23 +235,20 @@ def replace_with_fake_quant(model: nn.Module) -> nn.Module:
     """Replace SVDQW4A4Linear layers with fake-quantized W4A8 and patch fused ops.
 
     Call after from_pretrained so weights are already loaded. Builds replacement
-    layers on CPU. Caller should handle device placement (e.g.
-    pipeline.enable_sequential_cpu_offload()).
+    layers on the same device as the source. Caller should handle device
+    placement beforehand (e.g. pipeline.to("cpu") then
+    pipeline.enable_sequential_cpu_offload() after).
     """
     from .transformers.transformer_flux_v2 import NunchakuFluxAttention
 
-    for name, child in list(model.named_modules()):
+    for name, child in model.named_children():
         if isinstance(child, SVDQW4A4Linear):
-            *path, attr = name.split(".")
-            parent = model
-            for p in path:
-                parent = getattr(parent, p)
-            setattr(parent, attr, SVDQW4A8Linear.from_svdq_linear(child, device="cpu"))
+            setattr(model, name, SVDQW4A8Linear.from_svdq_linear(child))
+        else:
+            replace_with_fake_quant(child)
 
-    # Swap attention processors to pure-PyTorch version
-    for module in model.modules():
-        if isinstance(module, NunchakuFluxAttention):
-            module.processor = FakeQuantFluxAttnProcessor()
+    if isinstance(model, NunchakuFluxAttention):
+        model.processor = FakeQuantFluxAttnProcessor()
 
     return model
 
