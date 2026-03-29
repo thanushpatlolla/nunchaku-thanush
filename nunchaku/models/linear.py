@@ -113,8 +113,15 @@ class SVDQW4A8Linear(nn.Module):
 
         xg = x.reshape(-1, self.in_features // self.group_size, self.group_size)
         amax = xg.abs().amax(dim=-1, keepdim=True)
-        scale = torch.where(amax > 0, amax, torch.ones_like(amax)) / 127
-        x = (torch.round(xg / scale).clamp(-127, 127) * scale).reshape(-1, self.in_features)
+        amax = torch.where(amax > 0, amax, torch.ones_like(amax))
+        
+        if self.act_unsigned:
+            scale = amax / 255
+            x = (torch.round(xg / scale).clamp(0, 255) * scale).reshape(-1, self.in_features)
+        else:
+            scale = amax / 127
+            x = (torch.round(xg / scale).clamp(-127, 127) * scale).reshape(-1, self.in_features)
+
 
         out = lora + (x @ self.w_bf16.T).view(*in_shape[:-1], self.out_features)
 

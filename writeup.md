@@ -21,4 +21,6 @@ The `smooth_factor` tensor in the safetensors file is stored in the same packed 
 
 `replace_with_fake_quant(model)` recursively walks the module tree and swaps every `SVDQW4A4Linear` for a `SVDQW4A8Linear` built from its weights. This needs to be run after the weights are loaded into the model. Uses the from_svdq_linear method of the class. 
 
+**`nunchaku/models/transformers/transformer_flux_v2.py`** and **`nunchaku/models/attention.py`** — Both files gate the fused GELU MLP path (a CUDA op) on the linear layers being `SVDQW4A4Linear`. Without this, `fused_gelu_mlp` would still be called after swapping in `SVDQW4A8Linear` layers, bypassing the PyTorch forward pass entirely.
+
 **`test_w4a8.py`** — Loads FLUX.1-schnell via the V2 backend, generates a baseline image through the normal CUDA path, swaps in fake-quant layers, and then generates a second image with the same seed for comparison.
