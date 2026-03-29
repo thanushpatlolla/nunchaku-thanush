@@ -35,12 +35,20 @@ class SVDQW4A8Linear(nn.Module):
         self.out_features = out_features
         self.group_size = group_size
         self.act_unsigned = act_unsigned
-        self.register_buffer("smooth_factor", smooth_factor)
+        self.register_buffer("smooth_factor", self._unpack_smooth(smooth_factor))
         self.register_buffer("proj_down", unpack_lowrank_weight(proj_down, down=True).T)
         self.register_buffer("proj_up", unpack_lowrank_weight(proj_up, down=False))
         self.register_buffer("bias", bias)
         self.register_buffer("w_bf16", self._dequantize_weights(qweight, wscales))
       
+    @staticmethod
+    def _unpack_smooth(packed, block_size=128):
+        """Unpack smooth_factor from packed wscale MMA-tile format to plain per-channel."""
+        c = torch.arange(block_size, device=packed.device)
+        f = 16 * (c // 16) + 4 * ((c // 2) % 4) + 2 * ((c // 8) % 2) + c % 2
+        n_blocks = packed.shape[0] // block_size
+        return packed.reshape(n_blocks, block_size)[:, f].reshape(-1)
+
     def _dequantize_weights(self, qweight, wscales):
         #constants for bits=4, warp_n=128 in NunchakuWeightPacker.pack_weight from packer.py
         #we have to reverse the packer basically, thats what the views and permutes and
@@ -103,9 +111,10 @@ class SVDQW4A8Linear(nn.Module):
         x = x / self.smooth_factor
         x = x.reshape(-1, self.in_features)
 
-        amax = x.abs().amax()
-        scale = 1.0 if amax == 0 else amax / 127
-        x = torch.round(x / scale).clamp(-128, 127) * scale
+        xg = x.reshape(-1, self.in_features // self.group_size, self.group_size)
+        amax = xg.abs().amax(dim=-1, keepdim=True)
+        scale = torch.where(amax > 0, amax, torch.ones_like(amax)) / 127
+        x = (torch.round(xg / scale).clamp(-127, 127) * scale).reshape(-1, self.in_features)
 
         out = lora + (x @ self.w_bf16.T).view(*in_shape[:-1], self.out_features)
 
