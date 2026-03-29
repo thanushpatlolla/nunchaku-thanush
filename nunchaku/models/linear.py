@@ -130,50 +130,49 @@ class SVDQW4A8Linear(nn.Module):
         )
 
 
-def _unpack_rotemb(packed):
-    """Inverse of pack_rotemb from nunchaku.models.embeddings.
-
-    packed: [B, M, D] (MMA-packed rotary embeddings)
-    returns: [B, M, D//2, 1, 2] where [..., 0]=sin, [..., 1]=cos
-    """
-    B, M, D = packed.shape
-    x = packed.view(B, M // 16, D // 8, 8, 4, 2, 2)
-    x = x.permute(0, 1, 2, 5, 3, 4, 6)
-    x = x.reshape(B, M // 16, D // 8, 16, 8)
-    x = x.permute(0, 1, 3, 2, 4)
-    x = x.reshape(B, M, D // 2, 1, 2)
-    return x
-
-
-def _apply_rotary(x, rotemb):
-    """Apply rotary embedding from nunchaku raw format.
-
-    x: [B, S, heads, head_dim]
-    rotemb: [B_emb, S_emb, head_dim//2, 1, 2]  (sin=0, cos=1)
-    """
-    S = x.shape[1]
-    cos = rotemb[0, :S, :, 0, 1]  # [S, head_dim//2]
-    sin = rotemb[0, :S, :, 0, 0]  # [S, head_dim//2]
-
-    x_r, x_i = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D/2]
-    cos = cos[None, :, None, :]  # [1, S, 1, D/2]
-    sin = sin[None, :, None, :]
-    out_r = x_r.float() * cos - x_i.float() * sin
-    out_i = x_r.float() * sin + x_i.float() * cos
-    return torch.stack([out_r, out_i], dim=-1).flatten(-2).to(x.dtype)
-
-
 class FakeQuantFluxAttnProcessor:
     """PyTorch attention processor for SVDQW4A8Linear layers.
 
     Replaces NunchakuFluxFA2Processor when fused CUDA kernels cannot be used.
     """
 
+    @staticmethod
+    def _unpack_rotemb(packed):
+        """Inverse of pack_rotemb from nunchaku.models.embeddings.
+
+        packed: [B, M, D] (MMA-packed rotary embeddings)
+        returns: [B, M, D//2, 1, 2] where [..., 0]=sin, [..., 1]=cos
+        """
+        B, M, D = packed.shape
+        x = packed.view(B, M // 16, D // 8, 8, 4, 2, 2)
+        x = x.permute(0, 1, 2, 5, 3, 4, 6)
+        x = x.reshape(B, M // 16, D // 8, 16, 8)
+        x = x.permute(0, 1, 3, 2, 4)
+        x = x.reshape(B, M, D // 2, 1, 2)
+        return x
+
+    @staticmethod
+    def _apply_rotary(x, rotemb):
+        """Apply rotary embedding from nunchaku raw format.
+
+        x: [B, S, heads, head_dim]
+        rotemb: [B_emb, S_emb, head_dim//2, 1, 2]  (sin=0, cos=1)
+        """
+        S = x.shape[1]
+        cos = rotemb[0, :S, :, 0, 1]  # [S, head_dim//2]
+        sin = rotemb[0, :S, :, 0, 0]  # [S, head_dim//2]
+
+        x_r, x_i = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D/2]
+        cos = cos[None, :, None, :]  # [1, S, 1, D/2]
+        sin = sin[None, :, None, :]
+        out_r = x_r.float() * cos - x_i.float() * sin
+        out_i = x_r.float() * sin + x_i.float() * cos
+        return torch.stack([out_r, out_i], dim=-1).flatten(-2).to(x.dtype)
+
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, image_rotary_emb=None, **kwargs):
         B, S, C = hidden_states.shape
 
-        # Fused QKV via forward() (works with SVDQW4A8Linear)
         qkv = attn.to_qkv(hidden_states)
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.view(B, S, attn.heads, attn.head_dim)
@@ -182,17 +181,16 @@ class FakeQuantFluxAttnProcessor:
         q = attn.norm_q(q)
         k = attn.norm_k(k)
 
-        # Rotary embeddings for image tokens
         if isinstance(image_rotary_emb, tuple):
-            rotemb_img = _unpack_rotemb(image_rotary_emb[0])
+            rotemb_img = self._unpack_rotemb(image_rotary_emb[0])
         elif image_rotary_emb is not None:
-            rotemb_img = _unpack_rotemb(image_rotary_emb)
+            rotemb_img = self._unpack_rotemb(image_rotary_emb)
         else:
             rotemb_img = None
 
         if rotemb_img is not None:
-            q = _apply_rotary(q, rotemb_img)
-            k = _apply_rotary(k, rotemb_img)
+            q = self._apply_rotary(q, rotemb_img)
+            k = self._apply_rotary(k, rotemb_img)
 
         if attn.added_kv_proj_dim is not None and encoder_hidden_states is not None:
             S_ctx = encoder_hidden_states.shape[1]
@@ -204,15 +202,14 @@ class FakeQuantFluxAttnProcessor:
             q_c = attn.norm_added_q(q_c)
             k_c = attn.norm_added_k(k_c)
 
-            rotemb_txt = _unpack_rotemb(image_rotary_emb[1])
-            q_c = _apply_rotary(q_c, rotemb_txt)
-            k_c = _apply_rotary(k_c, rotemb_txt)
+            rotemb_txt = self._unpack_rotemb(image_rotary_emb[1])
+            q_c = self._apply_rotary(q_c, rotemb_txt)
+            k_c = self._apply_rotary(k_c, rotemb_txt)
 
             q = torch.cat([q_c, q], dim=1)
             k = torch.cat([k_c, k], dim=1)
             v = torch.cat([v_c, v], dim=1)
 
-        # SDPA
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
