@@ -12,11 +12,16 @@ WEIGHTS = "nunchaku-tech/nunchaku-flux.1-schnell/svdq-int4_r32-flux.1-schnell.sa
 transformer = NunchakuFluxTransformer2DModelV2.from_pretrained(WEIGHTS)
 pipeline = FluxPipeline.from_pretrained(MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16).to("cuda")
 
+def replace_attn_linears(module):
+    for name, child in module.named_children():
+        if isinstance(child, SVDQW4A4Linear):
+            setattr(module, name, SVDQW4A8Linear.from_svdq_linear(child).cuda())
+        else:
+            replace_attn_linears(child)
+
 for module in transformer.modules():
     if isinstance(module, NunchakuFluxAttention):
-        for name, child in module.named_children():
-            if isinstance(child, SVDQW4A4Linear):
-                setattr(module, name, SVDQW4A8Linear.from_svdq_linear(child).cuda())
+        replace_attn_linears(module)
         module.processor = FakeQuantFluxAttnProcessor()
 
 generator = torch.Generator(device="cuda").manual_seed(42)
